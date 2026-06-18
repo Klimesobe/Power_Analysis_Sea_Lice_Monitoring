@@ -1,0 +1,691 @@
+---
+title: "Power analysis: optimisation of sea lice monitoring programme"
+subtitle: "Abundance"
+author: "Bela Klimesova"
+date: "2026-06-16"
+output:
+  bookdown::pdf_document2:
+    latex_engine: xelatex
+fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(warn=-1)
+```
+
+# Preparation of sea lice dataset
+
+R packages necessary of data analysis
+```{r}
+library(ggplot2)
+library(glmmTMB)
+library(progress)
+suppressMessages(library(dplyr))
+suppressMessages(library(future.apply))
+library(progressr)
+```
+
+## Sea lice dataset
+
+Sea lice monitoring dataset provided by the industry producer
+```{r}
+Industry <- read.table(
+  "Industry.csv",
+  header = TRUE,
+  sep = ',',
+  fill = TRUE,
+  dec = ".",
+  na.strings = "NA"
+)
+```
+
+# Empirical data analysis
+
+## Modelling of temporal increase of sea lice abundance levels
+
+Adjustment of the variable pen: unique identification for each farm
+```{r}
+Industry$Pen_un <- paste(Industry$SiteName, Industry$Pen.Count, sep = "_")
+```
+
+GLMM model
+abundance increase per production week, random effects to take into account the hierarchical structure of the data
+
+```{r}
+mod_A <- glmmTMB(
+  Adult.female ~ Week_Production + (1 | SiteName) + (1 | Pen_un) + (1 | Year_Production),
+  family = nbinom2,
+  data = Industry
+)
+```
+
+Exploration of the model
+
+```{r}
+# Results overview
+summary(mod_A)
+
+# AIC
+AIC(mod_A)
+
+# Collinearity
+performance::model_performance(mod_A)
+```
+
+## Exploration of temporal increases in infection levels
+
+### Weekly increase for all farms
+Rates ratio increase of abundance converted to %
+```{r}
+slope <- fixef(mod_A)$cond["Week_Production"]
+RR <- exp(slope)
+per_increase <- (RR - 1) * 100
+per_increase
+```
+
+### Weekly increase for each farm separately
+
+GLMM of temporal increase for each farm
+```{r}
+mod_A1 <- glmmTMB(
+  Adult.female ~ Week_Production + (Week_Production |
+                                             SiteName) +
+    (1 | Pen_un) + (1 | Year_Production),
+  family = nbinom2,
+  data = Industry
+)
+```
+
+Calculation of percentage increase, rates ratio increase of abundance converted to %
+```{r}
+beta_fixed <- fixef(mod_A1)$cond["Week_Production"]
+ran <- ranef(mod_A1)$cond$SiteName
+site_dev <- ran[, "Week_Production"]
+
+site_slopes <- beta_fixed + site_dev
+RR_sites <- exp(site_slopes)
+perc_inc_sites <- (RR_sites - 1) * 100
+
+results <- data.frame(
+  Site = rownames(ran),
+  Slope = site_slopes,
+  Rate_Ratio = RR_sites,
+  Percent_Increase = perc_inc_sites
+)
+
+results
+```
+
+### Abundance variation between two consecutive inspections
+
+Comparing abundance levels between two consecutive visits in raw data
+
+Abundance at farm level
+```{r}
+Ind1 <- aggregate(
+  Industry$Adult.female,
+  list(
+    Industry$SiteName,
+    Industry$Year_Production,
+    Industry$Week_Production,
+    Industry$Count.Date
+  ),
+  mean
+)
+colnames(Ind1) <- c('Site', 'Year', 'Week', 'Date', 'Abun')
+
+Ind1$Date <- as.Date(Ind1$Date, format = "%Y-%m-%d")
+Ind1_s <- Ind1[order(Ind1$Date), ]
+```
+
+Calculation of percentage change in abundance levels
+```{r}
+Ind1_s <- Ind1_s %>%
+  arrange(Site, Date) %>%
+  group_by(Site) %>%
+  mutate(Abun_lag = lag(Abun),
+         Increase = ifelse(Abun_lag == 0 | is.na(Abun_lag), NA,
+                           ((Abun - Abun_lag) / Abun_lag) * 100)) %>% 
+      ungroup()
+
+Ind1_s$Increase <- round(Ind1_s$Increase)
+```
+
+Exploration of abundance change
+
+```{r}
+Ind1_s1 <- as.data.frame(Ind1_s)
+
+# Increase
+summary(Ind1_s1[Ind1_s1$Increase>0,]$Increase)
+
+# Decrease
+summary(Ind1_s1[Ind1_s1$Increase<0,]$Increase)
+```
+
+Increase in abundance from 0
+```{r}
+Ind_0<-Ind1_s[Ind1_s$Abun_lag == 0, ]
+Ind_0 <- as.data.frame(Ind_0)
+Ind_0<-Ind_0[!(is.na(Ind_0$Year)),]
+
+nrow(Ind_0[Ind_0$Abun>0.19,])/nrow(Ind_0)
+```
+
+## Estimated parameters from GLMM
+
+Slope: rate of abundance increase
+```{r}
+slope <- fixef(mod_A)$cond["Week_Production"]
+```
+
+Mean0: intercept on the log scale
+```{r}
+intercept <- fixef(mod_A)$cond["(Intercept)"]
+mean0 <- exp(intercept)
+```
+
+Theta
+```{r}
+theta <- 1 / (sigma(mod_A)^2)
+```
+
+Random effects sd
+```{r}
+vc <- VarCorr(mod_A)$cond
+
+site_sd <- as.numeric(attr(vc$SiteName, "stddev"))
+pen_sd <- as.numeric(attr(vc$Pen_un, "stddev"))
+year_sd <- as.numeric(attr(vc$Year_Production, "stddev"))
+```
+
+Number of fish per pen
+```{r}
+fish_per_pen <- Industry %>%
+  group_by(SiteName, Date, Pen.ID) %>%
+  summarise(n_fish = n_distinct(FishID), .groups = "drop") %>%
+  summarise(mean_fish = mean(n_fish)) %>%
+  pull(mean_fish) %>%
+  round()
+```
+
+Number of sites and years
+```{r}
+n_sites <- length(unique(Industry$SiteName))
+n_years <- length(unique(Industry$Year_Production))
+```
+
+# Simulation-based power analysis on national level
+
+## Power analysis function
+
+Function for simulation-based power analysis
+```{r}
+simulate_test_s <- function(site_sd,
+                            pen_sd,
+                            year_sd,
+                            n_sites,
+                            n_pens,
+                            n_years,
+                            fish_per_pen,
+                            n_visits,
+                            mean0,
+                            slope,
+                            theta,
+                            n_reps = 100) {
+  intercept <- log(mean0) # Convert baseline abundance to log scale
+  
+  # Run simulation
+  power_results <- replicate(n_reps, {    # run the simulation n_reps times
+    
+    # random effect
+    site_re <- rnorm(n_sites, 0, site_sd)
+    pen_re  <- rnorm(n_sites * n_pens, 0, pen_sd)
+    year_re <- rnorm(n_years, 0, year_sd)
+    
+    # study design
+    dat <- expand.grid(
+      Site = factor(1:n_sites),
+      Pen = factor(1:n_pens),
+      Week = 1:n_visits,
+      Year = factor(1:n_years)
+    )
+    
+    # random effect
+    dat$Pen_un <- interaction(dat$Site, dat$Pen)
+    pen_levels <- interaction(dat$Site, dat$Pen)
+    
+    dat$site_re <- site_re[dat$Site]
+    dat$pen_re <- pen_re[as.numeric(pen_levels)]
+    dat$year_re <- year_re[dat$Year]
+      
+    # Expand to fish-level data
+    dat_fish <- dat[rep(seq_len(nrow(dat)), each = fish_per_pen), ]
+    dat_fish$FishID <- rep(1:fish_per_pen, times = nrow(dat))
+    
+    # Linear predictor
+    eta <- intercept + slope * dat_fish$Week +
+      dat_fish$site_re + dat_fish$pen_re + dat_fish$year_re
+    mu <- exp(eta)
+    
+    # Generate counts per fish
+    dat_fish$Adult.female <- rnbinom(nrow(dat_fish), mu = mu, size = theta)
+    
+    # Fit model
+    formula <- "Adult.female ~ Week"
+    
+    # Add random effects only if more than 1 level exists
+    if (n_sites > 1)
+      formula <- paste0(formula, " + (1|Site)")
+    if (n_pens > 1)
+      formula <- paste0(formula, " + (1|Pen_un)")
+    if (n_years > 1)
+      formula <- paste0(formula, " + (1|Year)")
+    
+    m <- try(glmmTMB(as.formula(formula), family = nbinom2, data = dat_fish),
+             silent = TRUE)
+    
+    if (inherits(m, "try-error"))
+      return(NA)	# If model fails to converge, skip this replicate
+    if (!m$sdr$pdHess)
+      return(NA) # skip non-converged models
+    
+    # Detection rule
+    est <- summary(m)$coefficients$cond["Week", ]
+    est["Estimate"] > 0 && est["Pr(>|z|)"] < 0.05
+  })
+  
+  # Remove NAs (failed fits)
+  power_clean <- power_results[!is.na(power_results)]
+  
+  # Calculate power and confidence interval
+  power_estimate <- mean(power_clean)
+  ci <- binom.test(sum(power_clean), length(power_clean))$conf.int
+  
+  list(
+    power = power_estimate,
+    lower_CI = ci[1],
+    upper_CI = ci[2],
+    n_reps = length(power_clean)
+  )
+}
+```
+
+## Sampling scenarios
+
+Rates ratios (effect size)
+```{r}
+rate_ratios <- c(1.04, 1.06, 1.1, 1.2, 1.3)
+```
+
+Number of fish per pen
+```{r}
+fish_vec <- c(5, 10, 15, 20, 25, 30)
+```
+
+Number of visits
+```{r}
+visit_vec <- c(2, 3, 4, 6, 8)
+```
+
+Number of pens
+```{r}
+pen_vec <- c(2, 5, 8, 10, 12, 15)
+```
+
+Replicates
+```{r}
+n_reps <- 1000
+```
+
+## Simulation run
+
+In the following text the code to run simulation is provided, however, results are uploaded separately.
+
+Create design grid for all scenarios
+```{r}
+design_grid <- expand.grid(
+  RR = rate_ratios,
+  fish_per_pen = fish_vec,
+  n_visits = visit_vec,
+  n_pens = pen_vec
+)
+```
+
+Prepare columns for results
+```{r}
+design_grid$power <- NA_real_
+design_grid$lower_CI <- NA_real_
+design_grid$upper_CI <- NA_real_
+design_grid$n_success <- NA_integer_
+```
+
+Set parallel backend
+```{r}
+# plan(multisession) 
+```
+
+Reproducibility
+```{r}
+# set.seed(123)
+```
+
+Progress bar
+```{r}
+# handlers(global = TRUE)
+# handlers("txtprogressbar") 
+```
+
+Simulation
+```{r}
+# with_progress({
+#
+#  p <- progressr::progressor(steps = nrow(design_grid))
+
+#  results_list <- future_lapply(seq_len(nrow(design_grid)), function(i) {
+  
+  # Convert RR to slope
+#  slope_i <- log(design_grid$RR[i])
+  
+  # Run simulation
+# sim_res <- simulate_test_s(
+#    site_sd = site_sd,
+#    pen_sd = pen_sd,
+#    year_sd = year_sd,
+#    n_sites = n_sites,
+#    n_pens = design_grid$n_pens[i],
+#    n_years = n_years,
+#    fish_per_pen = design_grid$fish_per_pen[i],
+#    n_visits = design_grid$n_visits[i],
+#    mean0 = mean0,
+#    slope = slope_i,
+#    theta = theta,
+#    n_reps = n_reps
+#  )
+
+#    p()  
+  
+  # Return results
+#  list(
+#    power = sim_res$power,
+#    lower_CI = sim_res$lower_CI,
+#    upper_CI = sim_res$upper_CI,
+#    n_success = sim_res$n_reps
+#    )
+
+#  }, future.seed = TRUE)
+
+# })
+```
+
+Adding results to prepared dataset
+```{r}
+# design_grid$power      <- sapply(results_list, `[[`, "power")
+# design_grid$lower_CI   <- sapply(results_list, `[[`, "lower_CI")
+# design_grid$upper_CI   <- sapply(results_list, `[[`, "upper_CI")
+# design_grid$n_success  <- sapply(results_list, `[[`, "n_success")
+```
+
+Calculate increase [%] from RR
+```{r}
+# design_grid$perc_increase <- round((design_grid$RR - 1) * 100)
+```
+
+### Results of simulation
+
+Loading saved results of simulation
+```{r}
+design_grid <- readRDS("Abundance_National.rds")
+```
+
+## Results visualisation
+
+Substitute 1 for 0.999
+```{r}
+design_grid1 <- design_grid
+if (any(design_grid1$power == 1, na.rm = TRUE)) {
+  design_grid1$power[design_grid1$power == 1] <- 0.999
+}
+```
+
+Final plot for abundance on national level
+```{r fig1, fig.cap="Power analysis for abundance on national level"}
+ggplot(design_grid1, aes(x = fish_per_pen, y = n_pens, z = power)) +
+  geom_contour_filled(breaks = seq(0, 1, by = 0.1), alpha = 1) +
+  geom_contour(breaks = 0.8,
+               color = "black",
+               linewidth = 1.1) +
+  facet_grid(
+    perc_increase ~ n_visits,
+    labeller = labeller(
+      n_visits = function(x)
+        paste(x, "visits"),
+      perc_increase = function(x)
+        paste0(x, "% increase")
+    )
+  ) +
+  scale_fill_viridis_d(name = "Power", option = "A", begin = 0.15, end = 0.9) +
+  labs(
+    x = "Number of fish sampled per pen",
+    y = "Number of pens"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+Minimal sample size for each sampling scenario
+
+```{r}
+best_scenarios <- design_grid %>%
+  mutate(No_Fish = fish_per_pen * n_visits * n_pens) %>%
+  filter(power >= 0.8) %>%
+  group_by(perc_increase, n_visits) %>%
+  arrange(No_Fish, n_visits, n_pens, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(perc_increase, n_visits, n_pens, No_Fish) %>%
+  as.data.frame()
+
+Best<-best_scenarios[,c(9,3,4,2,10,5)]
+Best[,6]<-paste0(round(best_scenarios$power,2),' [',round(best_scenarios$lower_CI,2),', ',
+			round(best_scenarios$upper_CI,2),']')
+```
+
+```{r table1, results="asis", tab.cap="Minimal sample size for abundance at national level"}
+knitr::kable(Best)
+```
+
+# Simulation based-power analysis on farm level
+
+## Sampling scenarios
+
+Farm level: 1 farm per 1 production year
+```{r}
+n_sites <- 1
+n_years <- 1
+```
+
+Rates ratio (effect size)
+```{r}
+rate_ratios <- c(1.2, 1.3, 1.5, 2, 2.5)
+```
+
+Number of fish
+```{r}
+fish_vec <- c(5, 10, 15, 20, 25, 30)
+```
+
+Number of visits
+```{r}
+visit_vec <- c(4, 6, 8, 10, 12)
+```
+
+Number of pens
+```{r}
+pen_vec <- c(2, 5, 8, 10, 12, 15)
+```
+
+Replicates
+```{r}
+n_reps <- 1000
+```
+
+## Simulation run
+
+In the following text the code to run simulation is provided, however, results are uploaded separately.
+
+Create design grid for all scenarios
+```{r}
+design_grid <- expand.grid(
+  RR = rate_ratios,
+  fish_per_pen = fish_vec,
+  n_visits = visit_vec,
+  n_pens = pen_vec
+)
+```
+
+Prepare columns for results
+```{r}
+design_grid$power <- NA_real_
+design_grid$lower_CI <- NA_real_
+design_grid$upper_CI <- NA_real_
+design_grid$n_success <- NA_integer_
+```
+
+Set parallel backend
+```{r}
+# plan(multisession) 
+```
+
+Reproducibility
+```{r}
+# set.seed(123)
+```
+
+Progress bar
+```{r}
+# handlers(global = TRUE)
+# handlers("txtprogressbar") 
+```
+
+Simulation
+```{r}
+#with_progress({
+#
+#  p <- progressr::progressor(steps = nrow(design_grid))
+
+#  results_list <- future_lapply(seq_len(nrow(design_grid)), function(i) {
+  
+  # Convert RR to slope
+#  slope_i <- log(design_grid$RR[i])
+  
+  # Run simulation
+#  sim_res <- simulate_test_s(
+#    site_sd = site_sd,
+#    pen_sd = pen_sd,
+#    year_sd = year_sd,
+#    n_sites = n_sites,
+#    n_pens = design_grid$n_pens[i],
+#    n_years = n_years,
+#    fish_per_pen = design_grid$fish_per_pen[i],
+#    n_visits = design_grid$n_visits[i],
+#    mean0 = mean0,
+#    slope = slope_i,
+#    theta = theta,
+#    n_reps = n_reps
+#  )
+
+#    p()  
+  
+  # Return results
+#  list(
+#    power = sim_res$power,
+#    lower_CI = sim_res$lower_CI,
+#    upper_CI = sim_res$upper_CI,
+#    n_success = sim_res$n_reps
+#    )
+
+#  }, future.seed = TRUE)
+
+#})
+```
+
+Adding results to a prepared dataset
+```{r}
+# design_grid$power      <- sapply(results_list, `[[`, "power")
+# design_grid$lower_CI   <- sapply(results_list, `[[`, "lower_CI")
+# design_grid$upper_CI   <- sapply(results_list, `[[`, "upper_CI")
+# design_grid$n_success  <- sapply(results_list, `[[`, "n_success")
+```
+
+Calculate percent increase from RR for clarity
+```{r}
+# design_grid$perc_increase <- (design_grid$RR - 1) * 100
+```
+
+### Results of simulation
+
+Loading saved results of simulation
+```{r}
+design_grid <- readRDS("Abundance_Farm.rds")
+```
+
+## Results visualisation
+
+Substitute 1 for 0.999 due to visualization
+```{r}
+design_grid1 <- design_grid
+if (any(design_grid1$power == 1, na.rm = TRUE)) {
+  design_grid1$power[design_grid1$power == 1] <- 0.999
+}
+```
+
+Final plot for abundance on national level
+```{r fig2, fig.cap="Power analysis for abundance at farm level"}
+ggplot(design_grid1, aes(x = fish_per_pen, y = n_pens, z = power)) +
+  geom_contour_filled(breaks = seq(0, 1, by = 0.1), alpha = 1) +
+  geom_contour(breaks = 0.8,
+               color = "black",
+               linewidth = 1.1) +
+  facet_grid(
+    perc_increase ~ n_visits,
+    labeller = labeller(
+      n_visits = function(x)
+        paste(x, "visits"),
+      perc_increase = function(x)
+        paste0(x, "% increase")
+    )
+  ) +
+  scale_fill_viridis_d(name = "Power", option = "A", begin = 0.15, end = 0.9) +
+  labs(
+    x = "Number of fish sampled per pen",
+    y = "Number of pens"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+Calculation of minimal sample size
+```{r}
+best_scenarios <- design_grid %>%
+  mutate(No_Fish = fish_per_pen * n_visits * n_pens) %>%
+  filter(power >= 0.8) %>%
+  group_by(perc_increase, n_visits) %>%
+  arrange(No_Fish, n_visits, n_pens, .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(perc_increase, n_visits, n_pens, No_Fish) %>%
+  as.data.frame()
+
+Best<-best_scenarios[,c(9,3,4,2,10,5)]
+Best[,6]<-paste0(round(best_scenarios$power,2),' [',round(best_scenarios$lower_CI,2),', ',
+			round(best_scenarios$upper_CI,2),']')
+```
+
+```{r table2, results="asis", tab.cap="Minimal sample size for abundance at farm level"}
+knitr::kable(Best)
+```
+
+
+
